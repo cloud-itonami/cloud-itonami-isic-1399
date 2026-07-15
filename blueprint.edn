@@ -1,0 +1,37 @@
+{:itonami.blueprint/id "cloud-itonami-isic-1399"
+ :itonami.blueprint/name "Manufacture of other textiles n.e.c."
+ :itonami.blueprint/isic-rev5 "1399"
+ :itonami.blueprint/domain :textiles/nonwoven-technical
+ :itonami.blueprint/license "AGPL-3.0-or-later"
+ :itonami.blueprint/social-impact [:worker-safety :labor-standards :materials-traceability]
+ :itonami.blueprint/governor :nonwoven-technical-textiles-plant-operations-governor
+ :itonami.blueprint/robotics true
+ :itonami.blueprint/required-technologies [:robotics :identity :forms :dmn :bpmn :audit-ledger :cae]
+ :itonami.blueprint/status :public-oss
+ :itonami.blueprint/maturity :implemented
+ :itonami.blueprint/implemented-slice
+ "NonwovenAdvisor ⊣ Nonwoven & Technical Textiles Plant Operations
+ Governor, langgraph-clj StateGraph, append-only audit ledger. A plant
+ OPERATIONS COORDINATION actor for ISIC 1399 (Manufacture of other
+ textiles n.e.c.) -- a residual textile category (e.g. nonwovens,
+ felt, tire-cord fabric, technical/industrial textiles) distinct from
+ siblings 1392/1393/1394. This build's own chosen concrete
+ illustration is nonwoven/felt fabric manufacturing (needle-punched,
+ spunbond, or meltblown forming lines bonded into nonwoven fabric or
+ felt) -- not direct forming/bonding-line control authority. Four ops
+ (`:log-production-batch` / `:schedule-maintenance` /
+ `:flag-safety-concern` / `:coordinate-shipment`), all `:effect
+ :propose` only. Twelve concrete governor checks elaborate this
+ blueprint's four HARD invariants: propose-only effect, closed op
+ allowlist, closed proposal-effect allowlist (no direct forming-line
+ or bonding-line control), permanent direct-operate block, independent
+ equipment verification/registration before maintenance scheduling,
+ independent batch verification/registration before shipment
+ coordination, independent shipment-area recompute against the
+ batch's own logged area, double-schedule guard, quality-grade
+ validation, tensile-strength-test plausibility validation,
+ basis-weight-test plausibility validation, and defect-rate
+ plausibility validation. Safety-concern flagging (equipment-safety /
+ quality-defect) ALWAYS escalates to a human plant supervisor;
+ `:log-production-batch` is the only op eligible to auto-commit, and
+ only at phase 3 when governor-clean."}
