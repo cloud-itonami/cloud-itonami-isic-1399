@@ -1,0 +1,438 @@
+(ns nonwovenops.render-html
+  "Build-time HTML renderer for `docs/samples/operator-console.html`.
+
+  Closes flagship checklist item 2: this repo previously had NO demo
+  page and no generator at all. This namespace drives the REAL actor
+  stack -- `nonwovenops.operation` (a langgraph-clj StateGraph, entered
+  through `langgraph.graph/run*`, never around it) -> the independent
+  `nonwovenops.governor` -> the `nonwovenops.store` SSoT + append-only
+  ledger -- and renders the resulting store deterministically.
+
+  Input provenance (the property that makes this a demo and not a
+  mock): every entity id fed to the actor below is a batch or equipment
+  unit that `nonwovenops.store/sample-data!` actually seeds
+  (`batch-001`/`batch-002`/`batch-003`, `equip-001`/`equip-002`), and
+  every column rendered is a field the domain model actually carries.
+  The `mnt-*`/`ship-*`/`concern-*` ids are NOT looked up -- they are the
+  DRAFT record ids the ops themselves create (exactly as this repo's own
+  `nonwovenops.sim` demo driver does; that driver was run first,
+  `clojure -M:dev:run`, and confirmed to use ids that DO match the store
+  seed, so the scenario shape below was safe to adapt from it rather
+  than invented).
+
+  Nothing on the page is hand-typed telemetry. Every number, id,
+  disposition and basis is read back out of the store/ledger that the
+  run below produced; the only hand-written table is the fixed op/gate
+  contract, which is labelled as such.
+
+  Determinism: no timestamps and no random values reach the page, the
+  store's accessors sort by id, and the ledger/history channels are
+  append-only vectors -- so two consecutive runs against the same seed
+  are byte-identical (verify by diffing two runs).
+
+  Usage: `clojure -M:dev:render-html [out-file]`
+  (default `docs/samples/operator-console.html`)."
+  (:require [jp-go-dds.skin]
+            [clojure.string :as str]
+            [langgraph.graph :as g]
+            [nonwovenops.operation :as op]
+            [nonwovenops.store :as store]))
+
+(def ^:private coordinator
+  {:actor-id "coord-1" :actor-role :plant-coordinator :phase 3})
+
+(defn- exec! [actor tid request]
+  (g/run* actor {:request request :context coordinator} {:thread-id tid}))
+
+(defn- resume! [actor tid status]
+  (g/run* actor {:approval {:status status :by "coord-1"}}
+          {:thread-id tid :resume? true}))
+
+(defn run-demo!
+  "Runs a freshly seeded store through a scenario that reaches every
+  disposition this actor can produce, using ONLY seeded entities.
+
+  Clean lifecycle (batch-001 / equip-001 / equip-002):
+    - `:log-production-batch` on batch-001 -- governor-clean and the one
+      op in phase 3's `:auto` set, so it AUTO-COMMITS. The re-measured
+      tensile-strength/basis-weight/defect-rate values it carries are
+      visible in the batch table afterwards: proof the commit reached
+      the SSoT.
+    - `:schedule-maintenance` mnt-1 against equip-001 (verified +
+      registered forming line) -- governor-clean, but never auto-
+      eligible at any phase, so it ESCALATES; a human approves and it
+      commits (equip-001's `:last-scheduled-maintenance-date` and the
+      MNT- draft record are the SSoT evidence).
+    - `:flag-safety-concern` concern-1 against equip-002 -- ALWAYS
+      escalates (`:coordination/safety-concern` is high-stakes), and is
+      deliberately raised against the UNVERIFIED bonding line: a safety
+      concern is never gated on an administrative verification status.
+      Approved, committed.
+    - `:coordinate-shipment` ship-1 against batch-001 for 5000.0 m2 --
+      within the batch's own independently recomputed headroom,
+      escalates, approved, committed (batch-001's shipped-area goes
+      5000.0 -> 10000.0).
+
+  Human declines (the SOFT path's other outcome):
+    - `:coordinate-shipment` ship-2 against batch-001 for 3000.0 m2 --
+      also governor-clean and also within headroom, but the approver
+      REJECTS. `:approval-rejected` is written to the ledger and the
+      SSoT is not touched (batch-001's shipped-area stays 10000.0).
+
+  HARD holds -- each reached through the governor, none of which can
+  ever reach a human, one request per rule so no failure mode is only
+  implied by a happy path:
+    :line-operate-blocked, :equipment-not-verified, :already-scheduled,
+    :batch-not-verified, :shipment-area-exceeded, :invalid-grade,
+    :invalid-tensile-strength, :invalid-basis-weight,
+    :invalid-defect-rate, :not-propose-effect, and
+    :unknown-op + :equipment-control-blocked together.
+
+  Returns the store."
+  []
+  (let [db (-> (store/mem-store) (store/sample-data!))
+        actor (op/build db)]
+
+    ;; ---- clean lifecycle ------------------------------------------------
+    (exec! actor "t1" {:op :log-production-batch :effect :propose :subject "batch-001"
+                       :patch {:quality-grade :grade-a
+                               :tensile-strength-kn 12.4
+                               :basis-weight-gsm 152.0
+                               :defect-rate-percent 1.4
+                               :last-assessed "2026-07-14"}})
+
+    (exec! actor "t2" {:op :schedule-maintenance :effect :propose :subject "mnt-1"
+                       :value {:equipment-id "equip-001" :maintenance-type :die-inspection
+                               :scheduled-date "2026-08-01" :direct-operate? false}})
+    (resume! actor "t2" :approved)
+
+    (exec! actor "t3" {:op :flag-safety-concern :effect :propose :subject "concern-1"
+                       :value {:equipment-id "equip-002" :concern-type :equipment-safety
+                               :severity :moderate
+                               :description "接合ラインのガード固定に緩みを確認"}})
+    (resume! actor "t3" :approved)
+
+    (exec! actor "t4" {:op :coordinate-shipment :effect :propose :subject "ship-1"
+                       :value {:batch-id "batch-001" :area-square-meters 5000.0
+                               :destination "buyer-warehouse-north"}})
+    (resume! actor "t4" :approved)
+
+    ;; ---- escalated, then declined by the human --------------------------
+    (exec! actor "t5" {:op :coordinate-shipment :effect :propose :subject "ship-2"
+                       :value {:batch-id "batch-001" :area-square-meters 3000.0
+                               :destination "buyer-warehouse-west"}})
+    (resume! actor "t5" :rejected)
+
+    ;; ---- HARD holds ------------------------------------------------------
+    (exec! actor "t6" {:op :schedule-maintenance :effect :propose :subject "mnt-2"
+                       :value {:equipment-id "equip-001" :maintenance-type :emergency-run
+                               :scheduled-date "2026-09-01" :direct-operate? true}})
+
+    (exec! actor "t7" {:op :schedule-maintenance :effect :propose :subject "mnt-3"
+                       :value {:equipment-id "equip-002" :maintenance-type :adhesive-calibration
+                               :scheduled-date "2026-08-15" :direct-operate? false}})
+
+    (exec! actor "t8" {:op :schedule-maintenance :effect :propose :subject "mnt-1"
+                       :value {:equipment-id "equip-001" :maintenance-type :die-inspection
+                               :scheduled-date "2026-10-01" :direct-operate? false}})
+
+    (exec! actor "t9" {:op :coordinate-shipment :effect :propose :subject "ship-3"
+                       :value {:batch-id "batch-003" :area-square-meters 1000.0
+                               :destination "buyer-warehouse-south"}})
+
+    (exec! actor "t10" {:op :coordinate-shipment :effect :propose :subject "ship-4"
+                        :value {:batch-id "batch-002" :area-square-meters 1000.0
+                                :destination "buyer-warehouse-east"}})
+
+    (exec! actor "t11" {:op :log-production-batch :effect :propose :subject "batch-002"
+                        :patch {:quality-grade :premium-plus-select}})
+
+    (exec! actor "t12" {:op :log-production-batch :effect :propose :subject "batch-002"
+                        :patch {:tensile-strength-kn 999999.0}})
+
+    (exec! actor "t13" {:op :log-production-batch :effect :propose :subject "batch-002"
+                        :patch {:basis-weight-gsm 999999.0}})
+
+    (exec! actor "t14" {:op :log-production-batch :effect :propose :subject "batch-002"
+                        :patch {:defect-rate-percent 250.0}})
+
+    (exec! actor "t15" {:op :log-production-batch :effect :direct-write :subject "batch-002"
+                        :patch {:quality-grade :grade-b}})
+
+    (exec! actor "t16" {:op :actuate-forming-line :effect :propose :subject "batch-002"})
+
+    db))
+
+;; ----------------------------- rendering -----------------------------
+
+(defn- esc [v]
+  (-> (str v)
+      (str/replace "&" "&amp;")
+      (str/replace "<" "&lt;")
+      (str/replace ">" "&gt;")))
+
+(defn- kw-name [v]
+  (cond (keyword? v) (name v)
+        (nil? v) ""
+        :else (str v)))
+
+(defn- num4
+  "Round to 1/10000 -- the same granularity
+  `nonwovenops.registry/shipment-area-exceeded?` compares at -- so a
+  derived figure never shows double-representation noise."
+  [x]
+  (when (number? x) (/ (Math/round (* 10000.0 (double x))) 10000.0)))
+
+(defn- flag-cell [true-label false-label v]
+  (if (true? v)
+    (str "<span class=\"ok\">" true-label "</span>")
+    (str "<span class=\"critical\">" false-label "</span>")))
+
+(defn- last-decision
+  "The most recent ledger fact whose `:subject` is `id` and whose `:op`
+  is in `ops`. Only ops that actually take `id` as their subject are
+  ever passed in -- a maintenance/shipment op's subject is its own
+  DRAFT id, never the batch or equipment it references."
+  [ledger ops id]
+  (last (filter #(and (= (:subject %) id) (contains? ops (:op %))) ledger)))
+
+(defn- decision-cell
+  "Renders one ledger fact. The three `:t` values below are exactly the
+  fact types `nonwovenops.operation` appends to the ledger -- `:commit`
+  writes `:committed`, `:hold` writes `:governor-hold` or
+  `:approval-rejected`. `:approval-requested` and `:approval-granted`
+  exist only on the run's `:audit` channel and never reach the ledger,
+  so no cell is rendered for them."
+  [f]
+  (case (:t f)
+    nil "<span class=\"muted\">no decision recorded</span>"
+    :committed "<span class=\"ok\">committed</span>"
+    :governor-hold (str "<span class=\"critical\">HARD hold &middot; "
+                        (esc (str/join ", " (map kw-name (:basis f)))) "</span>")
+    :approval-rejected "<span class=\"warn\">declined by approver</span>"
+    (str "<span class=\"muted\">" (esc (kw-name (:t f))) "</span>")))
+
+(defn- batch-row [ledger {:keys [id product quality-grade area-square-meters
+                                 shipped-area-square-meters tensile-strength-kn
+                                 basis-weight-gsm defect-rate-percent
+                                 verified? registered? last-assessed]}]
+  (format (str "        <tr><td><code>%s</code></td><td>%s</td><td>%s</td><td class=\"num\">%s</td>"
+               "<td class=\"num\">%s</td><td class=\"num\">%s</td>"
+               "<td class=\"num\">%s</td><td class=\"num\">%s</td><td class=\"num\">%s</td>"
+               "<td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>")
+          (esc id) (esc product) (esc (kw-name quality-grade))
+          (esc (num4 area-square-meters))
+          (esc (num4 shipped-area-square-meters))
+          (esc (num4 (- (double (or area-square-meters 0.0))
+                        (double (or shipped-area-square-meters 0.0)))))
+          (esc (num4 tensile-strength-kn))
+          (esc (num4 basis-weight-gsm))
+          (esc (num4 defect-rate-percent))
+          (flag-cell "QC verified" "UNVERIFIED" verified?)
+          (flag-cell "registered" "unregistered" registered?)
+          (esc last-assessed)
+          (decision-cell (last-decision ledger #{:log-production-batch} id))))
+
+(defn- equipment-row [{:keys [id kind verified? registered?
+                              last-maintenance-date last-scheduled-maintenance-date]}]
+  (format (str "        <tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td>"
+               "<td>%s</td><td>%s</td></tr>")
+          (esc id) (esc (kw-name kind))
+          (flag-cell "inspected" "UNVERIFIED" verified?)
+          (flag-cell "registered" "unregistered" registered?)
+          (if last-maintenance-date
+            (esc last-maintenance-date)
+            "<span class=\"muted\">none on file</span>")
+          (if last-scheduled-maintenance-date
+            (str "<span class=\"ok\">" (esc last-scheduled-maintenance-date) "</span>")
+            "<span class=\"muted\">none scheduled</span>")))
+
+(defn- maintenance-draft-row [db record]
+  (let [mid (get record "maintenance_id")
+        m (store/maintenance db mid)]
+    (format (str "        <tr><td><code>%s</code></td><td><code>%s</code></td><td><code>%s</code></td>"
+                 "<td>%s</td><td>%s</td><td>%s</td></tr>")
+            (esc (get record "record_id")) (esc mid)
+            (esc (get record "equipment_id"))
+            (esc (kw-name (:maintenance-type m)))
+            (esc (:scheduled-date m))
+            (esc (get record "kind")))))
+
+(defn- shipment-draft-row [db record]
+  (let [sid (get record "shipment_id")
+        s (store/shipment db sid)]
+    (format (str "        <tr><td><code>%s</code></td><td><code>%s</code></td><td><code>%s</code></td>"
+                 "<td class=\"num\">%s</td><td>%s</td><td>%s</td></tr>")
+            (esc (get record "record_id")) (esc sid)
+            (esc (:batch-id s))
+            (esc (num4 (:area-square-meters s)))
+            (esc (:destination s))
+            (esc (get record "kind")))))
+
+(defn- concern-row [{:keys [id equipment-id concern-type severity description]}]
+  (format "        <tr><td><code>%s</code></td><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td></tr>"
+          (esc id) (esc equipment-id) (esc (kw-name concern-type))
+          (esc (kw-name severity)) (esc description)))
+
+(defn- ledger-row
+  "One ledger fact. `:confidence` is carried by the hold facts
+  (`nonwovenops.governor/hold-fact`) but NOT by `:committed` facts
+  (`nonwovenops.operation`'s own commit fact does not record it), so the
+  cell is explicitly marked rather than silently blank. `:basis` is the
+  violation detail where the governor wrote one, otherwise the rule /
+  cited-field keywords the fact itself carries."
+  [{:keys [t op subject basis violations confidence] :as f}]
+  (let [details (->> violations (map :detail) (remove str/blank?) seq)
+        basis-text (if details
+                     (str/join " / " details)
+                     (str/join ", " (map kw-name basis)))]
+    (format (str "        <tr><td>%s</td><td><code>%s</code></td><td><code>%s</code></td>"
+                 "<td>%s</td><td class=\"num\">%s</td><td>%s</td></tr>")
+            (esc (kw-name t)) (esc (kw-name op)) (esc subject)
+            (decision-cell f)
+            (if (number? confidence)
+              (esc confidence)
+              "<span class=\"muted\">not on this fact type</span>")
+            (esc basis-text))))
+
+(def ^:private action-gate-rows
+  ;; Static description of this actor's own fixed op/gate contract
+  ;; (`nonwovenops.governor/allowed-ops`, `nonwovenops.phase/phases`) --
+  ;; documentation of behaviour that does not vary per run, not runtime
+  ;; telemetry, so it is legitimately hand-described here rather than
+  ;; derived from the live run above. Everything else on this page IS
+  ;; derived from the run.
+  ["        <tr><td><code>:log-production-batch</code></td><td><span class=\"ok\">phase-3 auto-commit when governor-clean</span> &middot; grade / tensile-strength / basis-weight / defect-rate all range-checked</td></tr>"
+   "        <tr><td><code>:schedule-maintenance</code></td><td><span class=\"warn\">ALWAYS human approval &middot; never in any phase's <code>:auto</code> set</span> &middot; equipment verified+registered re-derived independently &middot; the same window is refused a second time off a dedicated <code>:scheduled?</code> fact &middot; <span class=\"critical\">:direct-operate? permanently blocked</span></td></tr>"
+   "        <tr><td><code>:flag-safety-concern</code></td><td><span class=\"warn\">ALWAYS human approval &middot; <code>:coordination/safety-concern</code> is high-stakes at every confidence</span> &middot; never gated on the equipment's verification status</td></tr>"
+   "        <tr><td><code>:coordinate-shipment</code></td><td><span class=\"warn\">phase-3: human approval (not auto-eligible)</span> &middot; batch verified+registered and shipment headroom both recomputed from the batch's own fields, never from the proposal's claim</td></tr>"
+   "        <tr><td><em>anything else</em></td><td><span class=\"critical\">HARD hold &middot; :unknown-op / :equipment-control-blocked</span> &middot; a proposal effect outside <code>#{:batch/upsert :maintenance/schedule :safety-concern/flag :shipment/propose}</code> is treated as direct forming-/bonding-line control and permanently refused</td></tr>"])
+
+(defn render
+  "Renders the whole operator-console document from a store `db` that
+  has already been driven by `run-demo!` (or any other real scenario)."
+  [db]
+  (let [ledger (vec (store/ledger db))
+        holds (filter #(= :governor-hold (:t %)) ledger)
+        commits (filter #(= :committed (:t %)) ledger)]
+    (str
+     "<!DOCTYPE html>\n"
+     "<html lang=\"en\"><head><meta charset=\"utf-8\">"
+     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">"
+     "<title>cloud-itonami-isic-1399 &middot; nonwoven &amp; technical textiles plant operations</title><style>"
+     (jp-go-dds.skin/dds+skin)
+     "</style></head><body>\n"
+     "<header class=\"bar\">\n"
+     "  <h1>Manufacture of other textiles n.e.c. (ISIC 1399) — Operator Console</h1>\n"
+     "  <span class=\"badge\">read-only sample · governor-gated · maintenance scheduling &amp; safety concerns always human-approved</span>\n"
+     "</header>\n"
+     "<main>\n"
+
+     "  <section class=\"card\">\n"
+     "    <p class=\"muted\">Build-time snapshot generated by <code>nonwovenops.render-html</code> (<code>clojure -M:dev:render-html</code>). "
+     "Every row below is read back out of <code>nonwovenops.store</code> after a real "
+     "<code>nonwovenops.operation</code> StateGraph run (<code>langgraph.graph/run*</code>) over the seeded plant — "
+     "<strong>" (count commits) "</strong> committed facts, <strong>" (count holds)
+     "</strong> HARD governor holds and <strong>" (count ledger)
+     "</strong> ledger facts in total. No timestamps, no random values: two runs against the same seed are byte-identical.</p>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Production batches</h2>\n"
+     "    <p class=\"muted\">Headroom is <code>area − shipped-to-date</code> recomputed from the batch's own permanent fields — the same ground truth the governor uses to refuse an over-area shipment, never a self-reported figure. "
+     "The last column is the most recent <code>:log-production-batch</code> decision for that batch as subject.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Batch</th><th>Product</th><th>Grade</th><th>Area m²</th><th>Shipped m²</th><th>Headroom m²</th><th>Tensile kN</th><th>Basis weight gsm</th><th>Defect %</th><th>QC</th><th>Registry</th><th>Last assessed</th><th>Last batch-log decision</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map (partial batch-row ledger) (store/all-batches db))) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Forming &amp; bonding line equipment</h2>\n"
+     "    <p class=\"muted\">No ledger fact ever carries an equipment id as its subject (a maintenance op's subject is its own draft id), so this table shows the equipment's own record only. "
+     "<em>Last scheduled</em> is written by the commit node — it is the SSoT evidence that an approved maintenance draft actually landed.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Unit</th><th>Line kind</th><th>Inspection</th><th>Registry</th><th>Last maintenance</th><th>Last scheduled</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map equipment-row (store/all-equipment db))) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Committed maintenance-schedule drafts</h2>\n"
+     "    <p class=\"muted\">Drafts built by <code>nonwovenops.registry/register-maintenance</code>. A draft is a record a plant coordinator keeps — this actor never actuates a forming or bonding line. Held proposals never reach this table.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Record</th><th>Maintenance</th><th>Equipment</th><th>Type</th><th>Scheduled date</th><th>Kind</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map (partial maintenance-draft-row db) (store/maintenance-history db))) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Committed shipment-coordination drafts</h2>\n"
+     "    <p class=\"muted\">Drafts built by <code>nonwovenops.registry/register-shipment</code>. No freight carrier is dispatched. The declined shipment (<code>ship-2</code>) and the over-area one (<code>ship-4</code>) are absent because neither ever reached the commit node.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Record</th><th>Shipment</th><th>Batch</th><th>Area m²</th><th>Destination</th><th>Kind</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map (partial shipment-draft-row db) (store/shipment-history db))) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Safety concerns</h2>\n"
+     "    <p class=\"muted\">Append-only concern log. Raised here against the <em>unverified</em> bonding line on purpose: safety reporting is never blocked on an administrative verification status, and it still required a human to approve.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Concern</th><th>Equipment</th><th>Type</th><th>Severity</th><th>Description</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map concern-row (store/safety-concerns db))) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Action gate (Nonwoven &amp; Technical Textiles Plant Operations Governor)</h2>\n"
+     "    <p class=\"muted\">Fixed contract — this table is a static description of the op allowlist and phase gate, not run output. HARD holds can never be overridden by a phase or by a human.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Op</th><th>Gate</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" action-gate-rows) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Audit ledger (this run)</h2>\n"
+     "    <p class=\"muted\">The append-only decision log the commit and hold nodes wrote, in order. "
+     "<code>:committed</code> means the SSoT was mutated; <code>:governor-hold</code> means a HARD violation stopped the proposal before any human saw it; "
+     "<code>:approval-rejected</code> means the governor cleared it, a human was asked, and the human said no. "
+     "Those three are exactly the fact types this actor appends — <code>:approval-requested</code> and <code>:approval-granted</code> live only on the run's <code>:audit</code> channel and never reach the ledger, so they have no row here. "
+     "The advisor's confidence is recorded on hold facts only.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Fact</th><th>Op</th><th>Subject</th><th>Decision</th><th>Advisor confidence</th><th>Basis</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map ledger-row ledger)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+     "</main>\n"
+     "<footer class=\"footer\">\n"
+     "  <p class=\"muted\">cloud-itonami-isic-1399 · AGPL-3.0-or-later · generated from the real actor stack, not a mock. Regenerate with <code>clojure -M:dev:render-html</code>.</p>\n"
+     "</footer>\n"
+     "</body></html>\n")))
+
+(defn -main [& args]
+  (let [out (or (first args) "docs/samples/operator-console.html")
+        db (run-demo!)
+        html (render db)]
+    (.mkdirs (.getParentFile (java.io.File. ^String out)))
+    (spit out html :encoding "UTF-8")
+    (println "wrote" out
+             (str "(" (count (store/ledger db)) " ledger facts, "
+                  (count (store/maintenance-history db)) " maintenance drafts, "
+                  (count (store/shipment-history db)) " shipment drafts, "
+                  (count (store/safety-concerns db)) " safety concerns)"))))
