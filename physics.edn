@@ -1,0 +1,33 @@
+;; What this vertical's robot physically does, declared for
+;; kotoba.robotics.process (kotoba-lang/robotics). `kbb -M:dev:physics` runs it.
+;;
+;; README has no "Robotics premise" section. This build's concrete product
+;; line is nonwoven/felt fabric (needle-punched, spunbond, meltblown; thermal,
+;; chemical or mechanical bonding). Its physical work here: through-air thermal
+;; bonding of a felt web, and pushing polypropylene melt through the melt line
+;; to the meltblown die.
+;;
+;; Every number without a cited source is marked `estimate` in its :basis.
+;; Replacing an estimate with a sourced value is this bot's growth work.
+{:physics/schema "itonami.physical-ai.spec.v1"
+ :repo "cloud-itonami/cloud-itonami-isic-1399"
+ :cases
+ [{:id :through-air-bonding
+   :kind :thermal
+   :procedure "needle-punched felt web with bicomponent binder fibre passes a through-air bonding oven until its middle reaches the binder's melting temperature; swept :thickness-m is HALF the thickness (heated face to mid-plane), mid-plane adiabatic by symmetry, so the back face is the middle"
+   :params {:conductivity-w-mk 0.04 :density-kg-m3 100.0 :specific-heat-j-kgk 1300.0
+            :t0-c 25.0 :t-hot-c 150.0 :h-front-w-m2k 60.0 :t-back-ambient-c 150.0 :h-back-w-m2k 0.0
+            :threshold-c 130.0 :duration-s 300.0 :nodes 11}
+   :sweep {:param :thickness-m :values [0.0015 0.0025 0.004 0.006 0.008]}
+   :quantity :time-to-threshold-s
+   :limit {:max 60.0 :basis "estimate: 1-minute residence in the through-air oven at line speed"}
+   :boundary {:lo 0.0005 :hi 0.015}}
+  {:id :meltblown-melt-line
+   :kind :pipe-flow
+   :procedure "melt pump pushes polypropylene melt through the heated melt line from the extruder to the meltblown die"
+   :params {:diameter-m 0.02 :length-m 3.0 :roughness-m 1.5e-6
+            :density-kg-m3 750.0 :viscosity-pa-s 50.0 :pump-efficiency 0.5 :elevation-m 0.0}
+   :sweep {:param :q-m3s :values [2.0e-5 5.0e-5 1.0e-4 2.0e-4 3.0e-4]}
+   :quantity :pressure-drop-pa
+   :limit {:max 1.0e7 :basis "estimate: 100 bar allowed across the melt line upstream of the die"}
+   :boundary {:lo 1.0e-5 :hi 1.0e-3}}]}
